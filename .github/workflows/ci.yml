@@ -49,12 +49,6 @@ jobs:
         observables_continue_on_error: false
         lfs: false
         submodules: recursive
-    - name: Assert instrumentation is live
-      if: env.CHALK_ON == 'true'
-      run: |
-        test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-        test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
-
     - name: Get specific submodule hash
       id: core-v-submodule-hash
       run: |
@@ -65,34 +59,111 @@ jobs:
       id: cache-toolchain
       uses: actions/cache@v6
       env:
-          cache-name: cache-toolchain
+        cache-name: cache-toolchain
       with:
-          path: tools/riscv-toolchain/
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('ci/install-toolchain.sh') }}
+        path: tools/riscv-toolchain/
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('ci/install-toolchain.sh') }}
 
     - name: Cache verilator
       id: cache-verilator
       uses: actions/cache@v6
       env:
-          cache-name: cache-verilator
+        cache-name: cache-verilator
       with:
-          path: tools/verilator/
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-verilator.sh') }}
+        path: tools/verilator/
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-verilator.sh') }}
 
     - name: Cache Spike
       id: cache-spike
       uses: actions/cache@v6
       env:
-          cache-name: cache-spike
+        cache-name: cache-spike
       with:
-          path: tools/spike/
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-spike.sh')}}-${{ steps.core-v-submodule-hash.outputs.hash }}
+        path: tools/spike/
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-spike.sh')}}-${{ steps.core-v-submodule-hash.outputs.hash }}
 
     - name: Prepare
       run: |
-          ci/setup.sh
+        ci/setup.sh
 
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   execute-riscv64-tests:
     name: execute-riscv64-tests
     runs-on: ubuntu-latest
@@ -101,18 +172,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        testcase:  [ cv64a6_imafdc_tests ]
-        config:    [ cv64a6_imafdc_sv39_hpdcache, cv64a6_imafdc_sv39_hpdcache_wb, cv64a6_imafdc_sv39_wb, cv64a6_imafdc_sv39 ]
-        simulator: [ veri-testharness ]
+        testcase: [cv64a6_imafdc_tests]
+        config: [cv64a6_imafdc_sv39_hpdcache, cv64a6_imafdc_sv39_hpdcache_wb, cv64a6_imafdc_sv39_wb, cv64a6_imafdc_sv39]
+        simulator: [veri-testharness]
         include:
-          - testcase: dv-riscv-arch-test
-            config: cv64a6_imafdc_sv39_hpdcache
-            simulator: veri-testharness
-          - testcase: dv-riscv-arch-test
-            config: cv64a6_imafdc_sv39_hpdcache_wb
-            simulator: veri-testharness
-    needs:
-      build-riscv-tests
+        - testcase: dv-riscv-arch-test
+          config: cv64a6_imafdc_sv39_hpdcache
+          simulator: veri-testharness
+        - testcase: dv-riscv-arch-test
+          config: cv64a6_imafdc_sv39_hpdcache_wb
+          simulator: veri-testharness
+    needs: build-riscv-tests
     steps:
     - name: Checkout code
       uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
@@ -122,12 +192,6 @@ jobs:
         observables_continue_on_error: false
         lfs: false
         submodules: recursive
-    - name: Assert instrumentation is live
-      if: env.CHALK_ON == 'true'
-      run: |
-        test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-        test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
-
     - name: Get specific submodule hash
       id: core-v-submodule-hash
       run: |
@@ -138,36 +202,36 @@ jobs:
       id: cache-toolchain
       uses: actions/cache@v6
       env:
-          cache-name: cache-toolchain
+        cache-name: cache-toolchain
       with:
-          path: tools/riscv-toolchain/
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('ci/install-toolchain.sh') }}
+        path: tools/riscv-toolchain/
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('ci/install-toolchain.sh') }}
 
     - name: Cache verilator
       id: cache-verilator
       uses: actions/cache@v6
       env:
-          cache-name: cache-verilator
+        cache-name: cache-verilator
       with:
-          path: tools/verilator/
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-verilator.sh') }}
+        path: tools/verilator/
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-verilator.sh') }}
 
     - name: Cache Spike
       id: cache-spike
       uses: actions/cache@v6
       env:
-          cache-name: cache-spike
+        cache-name: cache-spike
       with:
-          path: tools/spike/
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-spike.sh')}}-${{ steps.core-v-submodule-hash.outputs.hash }}
+        path: tools/spike/
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-spike.sh')}}-${{ steps.core-v-submodule-hash.outputs.hash }}
 
     - name: Run Tests
       run: |
-          set -x
-          export RISCV=$(pwd)/tools/riscv-toolchain/
-          source ci/install-prereq.sh
-          source verif/sim/setup-env.sh
-          DV_SIMULATORS=${{matrix.simulator}},spike DV_TARGET=${{matrix.config}} bash verif/regress/${{matrix.testcase}}.sh
+        set -x
+        export RISCV=$(pwd)/tools/riscv-toolchain/
+        source ci/install-prereq.sh
+        source verif/sim/setup-env.sh
+        DV_SIMULATORS=${{matrix.simulator}},spike DV_TARGET=${{matrix.config}} bash verif/regress/${{matrix.testcase}}.sh
 
     - name: Upload Lint Report to Github
       uses: actions/upload-artifact@v4
@@ -177,6 +241,83 @@ jobs:
         retention-days: 10
 
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   execute-riscv32-tests:
     name: execute-riscv32-tests
     runs-on: ubuntu-latest
@@ -185,11 +326,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        testcase:  [ dv-riscv-arch-test, cv32a6_tests ]
-        config:    [ cv32a65x ]
-        simulator: [ veri-testharness ]
-    needs:
-      build-riscv-tests
+        testcase: [dv-riscv-arch-test, cv32a6_tests]
+        config: [cv32a65x]
+        simulator: [veri-testharness]
+    needs: build-riscv-tests
     steps:
     - name: Checkout code
       uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
@@ -199,12 +339,6 @@ jobs:
         observables_continue_on_error: false
         lfs: false
         submodules: recursive
-    - name: Assert instrumentation is live
-      if: env.CHALK_ON == 'true'
-      run: |
-        test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-        test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
-
     - name: Get specific submodule hash
       id: core-v-submodule-hash
       run: |
@@ -215,36 +349,36 @@ jobs:
       id: cache-toolchain
       uses: actions/cache@v6
       env:
-          cache-name: cache-toolchain
+        cache-name: cache-toolchain
       with:
-          path: tools/riscv-toolchain/
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('ci/install-toolchain.sh') }}
+        path: tools/riscv-toolchain/
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('ci/install-toolchain.sh') }}
 
     - name: Cache verilator
       id: cache-verilator
       uses: actions/cache@v6
       env:
-          cache-name: cache-verilator
+        cache-name: cache-verilator
       with:
-          path: tools/verilator/
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-verilator.sh') }}
+        path: tools/verilator/
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-verilator.sh') }}
 
     - name: Cache Spike
       id: cache-spike
       uses: actions/cache@v6
       env:
-          cache-name: cache-spike
+        cache-name: cache-spike
       with:
-          path: tools/spike/
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-spike.sh')}}-${{ steps.core-v-submodule-hash.outputs.hash }}
+        path: tools/spike/
+        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('verif/regress/install-spike.sh')}}-${{ steps.core-v-submodule-hash.outputs.hash }}
 
     - name: Run Tests
       run: |
-          set -x
-          export RISCV=$(pwd)/tools/riscv-toolchain/
-          source ci/install-prereq.sh
-          source verif/sim/setup-env.sh
-          DV_SIMULATORS=${{matrix.simulator}},spike DV_TARGET=${{matrix.config}} bash verif/regress/${{matrix.testcase}}.sh
+        set -x
+        export RISCV=$(pwd)/tools/riscv-toolchain/
+        source ci/install-prereq.sh
+        source verif/sim/setup-env.sh
+        DV_SIMULATORS=${{matrix.simulator}},spike DV_TARGET=${{matrix.config}} bash verif/regress/${{matrix.testcase}}.sh
 
     - name: Upload Lint Report to Github
       uses: actions/upload-artifact@v4
@@ -252,3 +386,80 @@ jobs:
         name: ${{matrix.simulator}}.${{matrix.testcase}}.${{matrix.config}}
         path: 'verif/sim/out*'
         retention-days: 10
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
